@@ -1,22 +1,75 @@
 import logging
 import uuid
+import json
+import os
 from datetime import datetime
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    CallbackContext,
+    CallbackQueryHandler
+)
 
-# Включим логирование
+# Настройка логирования
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Токен вашего бота (ЗАМЕНИТЕ НА ВАШ НОВЫЙ ТОКЕН!)
+# Токен вашего бота
 BOT_TOKEN = "7990174156:AAECQ7djna9rkR8AhZYL37NiL4-JkPu1bi8"
-
+DATA_FILE = "bot_data.json"
 
 # --- Вспомогательные функции ---
 
-def get_project_id_by_name(bot_data, project_name, user_id):
+def load_data() -> dict:
+    """Загрузка сохраненных данных из файла с обработкой ошибок"""
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, 'r') as f:
+                data = json.load(f)
+
+            # Преобразуем списки обратно в множества
+            if 'projects' in data:
+                for project in data['projects'].values():
+                    if 'members' in project:
+                        project['members'] = set(project['members'])
+
+            return data
+        except json.JSONDecodeError:
+            print("Ошибка: файл данных содержит некорректные данные JSON.")
+            return {}
+    return {}
+
+
+def save_data(data: dict) -> None:
+    """Сохранение данных в файл с преобразованием множеств в списки"""
+    # Создаем копию данных для преобразования
+    data_to_save = {}
+
+    # Преобразуем множества в списки
+    for key, value in data.items():
+        if isinstance(value, dict):
+            data_to_save[key] = {}
+            for sub_key, sub_value in value.items():
+                if isinstance(sub_value, set):
+                    data_to_save[key][sub_key] = list(sub_value)
+                else:
+                    data_to_save[key][sub_key] = sub_value
+        else:
+            data_to_save[key] = value
+
+    # Сохраняем преобразованные данные
+    with open(DATA_FILE, 'w') as f:
+        json.dump(data_to_save, f, indent=2)
+
+
+def get_project_id_by_name(bot_data: dict, project_name: str, user_id: int) -> str:
+    """Поиск проекта по имени с проверкой членства"""
     if 'projects' not in bot_data:
         return None
     for proj_id, project in bot_data['projects'].items():
@@ -24,8 +77,8 @@ def get_project_id_by_name(bot_data, project_name, user_id):
             return proj_id
     return None
 
-
-def get_project_by_name_owner_only(bot_data, project_name, owner_id):
+def get_project_by_name_owner_only(bot_data: dict, project_name: str, owner_id: int) -> str:
+    """Поиск проекта по имени с проверкой владельца"""
     if 'projects' not in bot_data:
         return None
     for proj_id, project in bot_data['projects'].items():
@@ -33,48 +86,72 @@ def get_project_by_name_owner_only(bot_data, project_name, owner_id):
             return proj_id
     return None
 
+async def resolve_user_id(context: CallbackContext, username: str) -> int:
+    """Попытка разрешить username в user_id"""
+    if not username.startswith('@'):
+        return None
+
+    try:
+        # Удаляем @ в начале
+        username = username[1:]
+        # Пытаемся получить информацию о пользователе
+        user = await context.bot.get_chat(username)
+        return user.id
+    except Exception as e:
+        logger.warning(f"Failed to resolve username {username}: {e}")
+        return None
 
 # --- Обработчики команд ---
 
 async def start(update: Update, context: CallbackContext) -> None:
+    """Обработчик команды /start"""
     user = update.effective_user
-    welcome_message = rf"Привет, {user.mention_html()}! Я твой бот для версионирования документов." \
-                      rf"\n\nВот инструкция по использованию:"
-
-    await update.message.reply_html(welcome_message)
-
-    instructions = (
-        "Сначала отправьте мне документ (файл). Затем используйте команды:\n"
-        "/newproject <название_проекта> - Создать новый проект из последнего отправленного документа.\n"
-        "/commit <название_проекта> [описание_изменений] - Сохранить последнюю отправленную версию документа в существующий проект.\n"
-        "/listprojects - Показать список ваших проектов и проектов, где вы участник.\n"
-        "/versions <название_проекта> - Показать все версии документа в проекте.\n"
-        "/get <название_проекта> [номер_версии] - Получить конкретную версию документа (если номер не указан - последнюю).\n"
-        "/addmember <название_проекта> <user_id или @username> - Добавить пользователя в проект (только владелец).\n"
-        "/removemember <название_проекта> <user_id или @username> - Удалить пользователя из проекта (только владелец).\n"
-        "/members <название_проекта> - Показать участников проекта.\n\n"
-        "Важно: для команд /newproject и /commit сначала отправьте файл боту, он запомнит его.\n\n"
-        "Вы также можете использовать команду /help в любой момент для повторного вызова этой инструкции."
+    welcome_message = (
+        f"Привет, {user.mention_html()}! Я твой бот для версионирования документов.\n\n"
+        "Вот инструкция по использованию:"
     )
-    await update.message.reply_text(instructions)
 
+    keyboard = [
+        [InlineKeyboardButton("Показать инструкцию", callback_data='show_help')],
+        [InlineKeyboardButton("Мои проекты", callback_data='list_projects')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_html(welcome_message, reply_markup=reply_markup)
 
 async def help_command(update: Update, context: CallbackContext) -> None:
-    await update.message.reply_text(
-        "Сначала отправьте мне документ (файл). Затем используйте команды:\n"
-        "/newproject <название_проекта> - Создать новый проект из последнего отправленного документа.\n"
-        "/commit <название_проекта> [описание_изменений] - Сохранить последнюю отправленную версию документа в существующий проект.\n"
-        "/listprojects - Показать список ваших проектов и проектов, где вы участник.\n"
-        "/versions <название_проекта> - Показать все версии документа в проекте.\n"
-        "/get <название_проекта> [номер_версии] - Получить конкретную версию документа (если номер не указан - последнюю).\n"
-        "/addmember <название_проекта> <user_id или @username> - Добавить пользователя в проект (только владелец).\n"
-        "/removemember <название_проекта> <user_id или @username> - Удалить пользователя из проекта (только владелец).\n"
-        "/members <название_проекта> - Показать участников проекта.\n\n"
-        "Важно: для команд /newproject и /commit сначала отправьте файл боту, он запомнит его."
+    """Обработчик команды /help"""
+    instructions = (
+        "📚 Инструкция по использованию:\n\n"
+        "1. Сначала отправьте мне документ (файл).\n"
+        "2. Затем используйте команды:\n\n"
+        "📂 Проекты:\n"
+        "/newproject <название> - Создать новый проект\n"
+        "/listprojects - Список ваших проектов\n"
+        "/members <проект> - Участники проекта\n\n"
+        "🔄 Версии:\n"
+        "/commit <проект> [описание] - Сохранить новую версию\n"
+        "/versions <проект> - Все версии проекта\n"
+        "/get <проект> [версия] - Получить версию\n\n"
+        "👥 Управление доступом:\n"
+        "/addmember <проект> <user> - Добавить участника\n"
+        "/removemember <проект> <user> - Удалить участника\n\n"
+        "Для команд /newproject и /commit сначала отправьте файл боту."
     )
 
+    keyboard = [
+        [InlineKeyboardButton("Создать проект", callback_data='new_project')],
+        [InlineKeyboardButton("Мои проекты", callback_data='list_projects')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if update.message is not None:
+        await update.message.reply_text(instructions, reply_markup=reply_markup)
+    else:
+        print("No message found in the update")
 
 async def handle_document(update: Update, context: CallbackContext) -> None:
+    """Обработка загруженных документов"""
     user_id = update.effective_user.id
     context.user_data['last_file_id'] = update.message.document.file_id
     context.user_data['last_file_name'] = update.message.document.file_name
@@ -82,15 +159,41 @@ async def handle_document(update: Update, context: CallbackContext) -> None:
 
     logger.info(
         f"User {user_id} uploaded file {update.message.document.file_name} with id {update.message.document.file_id}")
+
+    keyboard = [
+        [
+            InlineKeyboardButton("Создать новый проект", callback_data='new_project'),
+            InlineKeyboardButton("Обновить существующий", callback_data='commit_project')
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
     await update.message.reply_text(
-        f"Файл '{update.message.document.file_name}' получен. Теперь вы можете:\n"
-        f"- Создать новый проект: /newproject <название_проекта>\n"
-        f"- Обновить существующий: /commit <название_проекта> [описание]"
+        f"Файл '{update.message.document.file_name}' получен. Выберите действие:",
+        reply_markup=reply_markup
     )
 
-
 async def new_project(update: Update, context: CallbackContext) -> None:
+    """Создание нового проекта"""
     user_id = update.effective_user.id
+
+    # Если это callback от кнопки
+    if update.callback_query:
+        await update.callback_query.answer()
+        if 'last_file_id' not in context.user_data:
+            await update.callback_query.edit_message_text(
+                "Сначала отправьте документ, который хотите добавить в новый проект."
+            )
+            return
+
+        await update.callback_query.edit_message_text(
+            "Введите название нового проекта:"
+        )
+        context.user_data['awaiting_project_name'] = True
+        context.user_data['action'] = 'new_project'
+        return
+
+    # Если это обычная команда
     if 'last_file_id' not in context.user_data:
         await update.message.reply_text("Сначала отправьте документ, который хотите добавить в новый проект.")
         return
@@ -99,14 +202,23 @@ async def new_project(update: Update, context: CallbackContext) -> None:
         await update.message.reply_text("Пожалуйста, укажите название проекта: /newproject <название_проекта>")
         return
 
-    project_name = " ".join(context.args)
+    await _create_project(update, context, " ".join(context.args))
+
+async def _create_project(update: Update, context: CallbackContext, project_name: str) -> None:
+    """Внутренняя функция создания проекта"""
+    user_id = update.effective_user.id
 
     if 'projects' not in context.bot_data:
         context.bot_data['projects'] = {}
 
+    # Проверка на существующий проект
     for proj_data in context.bot_data['projects'].values():
         if proj_data['name'].lower() == project_name.lower() and proj_data['owner_id'] == user_id:
-            await update.message.reply_text(f"Проект с названием '{project_name}' уже существует у вас.")
+            if update.callback_query:
+                await update.callback_query.edit_message_text(
+                    f"Проект с названием '{project_name}' уже существует у вас.")
+            else:
+                await update.message.reply_text(f"Проект с названием '{project_name}' уже существует у вас.")
             return
 
     project_id = str(uuid.uuid4())
@@ -118,7 +230,7 @@ async def new_project(update: Update, context: CallbackContext) -> None:
     context.bot_data['projects'][project_id] = {
         "name": project_name,
         "owner_id": user_id,
-        "members": {user_id},
+        "members": {str(user_id)},  # Сохраняем как строку для JSON
         "versions": [{
             "file_id": context.user_data['last_file_id'],
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -131,19 +243,60 @@ async def new_project(update: Update, context: CallbackContext) -> None:
         "next_version_num": new_version_num + 1
     }
 
-    del context.user_data['last_file_id']
-    if 'last_file_caption' in context.user_data:
-        del context.user_data['last_file_caption']
-    if 'last_file_name' in context.user_data:
-        del context.user_data['last_file_name']
+    # Очистка временных данных
+    for key in ['last_file_id', 'last_file_caption', 'last_file_name', 'awaiting_project_name', 'action']:
+        if key in context.user_data:
+            del context.user_data[key]
 
-    await update.message.reply_text(
-        f"Проект '{project_name}' (ID: {project_id[:8]}) создан. Первая версия документа добавлена.")
+    # Сохранение данных
+    save_data(context.bot_data)
+
+    message_text = f"✅ Проект '{project_name}' создан. Первая версия документа добавлена."
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(message_text)
+    else:
+        await update.message.reply_text(message_text)
+
     logger.info(f"User {user_id} created project '{project_name}' (ID: {project_id})")
 
-
 async def commit_version(update: Update, context: CallbackContext) -> None:
+    """Добавление новой версии в проект"""
     user_id = update.effective_user.id
+
+    # Если это callback от кнопки
+    if update.callback_query:
+        await update.callback_query.answer()
+        if 'last_file_id' not in context.user_data:
+            await update.callback_query.edit_message_text(
+                "Сначала отправьте документ, который хотите закоммитить."
+            )
+            return
+
+        # Получаем список проектов пользователя
+        user_projects = []
+        if 'projects' in context.bot_data:
+            for proj_id, project in context.bot_data['projects'].items():
+                if user_id in project['members']:
+                    user_projects.append(project['name'])
+
+        if not user_projects:
+            await update.callback_query.edit_message_text("У вас нет проектов для обновления.")
+            return
+
+        # Создаем кнопки для выбора проекта
+        keyboard = []
+        for project in user_projects[:10]:  # Ограничим количество кнопок
+            keyboard.append([InlineKeyboardButton(project, callback_data=f'commit_to:{project}')])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.callback_query.edit_message_text(
+            "Выберите проект для обновления:",
+            reply_markup=reply_markup
+        )
+        return
+
+    # Если это обычная команда
     if 'last_file_id' not in context.user_data:
         await update.message.reply_text("Сначала отправьте документ, который хотите закоммитить.")
         return
@@ -156,23 +309,35 @@ async def commit_version(update: Update, context: CallbackContext) -> None:
     commit_message_from_args = " ".join(context.args[1:])
     commit_message_from_caption = context.user_data.get('last_file_caption')
 
-    if commit_message_from_args:
-        commit_message = commit_message_from_args
-    elif commit_message_from_caption:
-        commit_message = commit_message_from_caption
-    else:
-        commit_message = f"Update by {update.effective_user.full_name}"
+    commit_message = (
+        commit_message_from_args if commit_message_from_args else
+        commit_message_from_caption if commit_message_from_caption else
+        f"Update by {update.effective_user.full_name}"
+    )
 
-    project_id = get_project_id_by_name(context.bot_data, project_name_arg, user_id)
+    await _add_version_to_project(update, context, project_name_arg, commit_message)
+
+async def _add_version_to_project(update: Update, context: CallbackContext, project_name: str,
+                                  commit_message: str) -> None:
+    """Внутренняя функция добавления версии в проект"""
+    user_id = update.effective_user.id
+    project_id = get_project_id_by_name(context.bot_data, project_name, user_id)
 
     if not project_id:
-        await update.message.reply_text(f"Проект '{project_name_arg}' не найден или у вас нет к нему доступа.")
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                f"Проект '{project_name}' не найден или у вас нет к нему доступа.")
+        else:
+            await update.message.reply_text(f"Проект '{project_name}' не найден или у вас нет к нему доступа.")
         return
 
     project = context.bot_data['projects'][project_id]
 
-    if user_id not in project['members']:
-        await update.message.reply_text(f"Вы не являетесь участником проекта '{project['name']}'.")
+    if str(user_id) not in project['members']:
+        if update.callback_query:
+            await update.callback_query.edit_message_text(f"Вы не являетесь участником проекта '{project['name']}'.")
+        else:
+            await update.message.reply_text(f"Вы не являетесь участником проекта '{project['name']}'.")
         return
 
     new_version_num = project["next_version_num"]
@@ -187,37 +352,115 @@ async def commit_version(update: Update, context: CallbackContext) -> None:
     })
     project["next_version_num"] += 1
 
-    del context.user_data['last_file_id']
-    if 'last_file_caption' in context.user_data:
-        del context.user_data['last_file_caption']
-    if 'last_file_name' in context.user_data:
-        del context.user_data['last_file_name']
+    # Очистка временных данных
+    for key in ['last_file_id', 'last_file_caption', 'last_file_name']:
+        if key in context.user_data:
+            del context.user_data[key]
 
-    await update.message.reply_text(
-        f"Новая версия ({new_version_num}) документа добавлена в проект '{project['name']}'.")
+    # Сохранение данных
+    save_data(context.bot_data)
+
+    message_text = f"✅ Новая версия ({new_version_num}) документа добавлена в проект '{project['name']}'."
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(message_text)
+    else:
+        await update.message.reply_text(message_text)
+
     logger.info(f"User {user_id} committed version {new_version_num} to project '{project['name']}' (ID: {project_id})")
 
-
 async def list_projects(update: Update, context: CallbackContext) -> None:
+    """Список проектов пользователя"""
     user_id = update.effective_user.id
+
+    # Если это callback от кнопки
+    if update.callback_query:
+        await update.callback_query.answer()
+
     if 'projects' not in context.bot_data or not context.bot_data['projects']:
-        await update.message.reply_text("Пока нет ни одного проекта.")
+        message = "Пока нет ни одного проекта."
+        if update.callback_query:
+            await update.callback_query.edit_message_text(message)
+        else:
+            await update.message.reply_text(message)
         return
 
     user_projects = []
     for proj_id, project in context.bot_data['projects'].items():
-        if user_id in project['members']:
-            role = "(Владелец)" if project['owner_id'] == user_id else "(Участник)"
-            user_projects.append(f"- {project['name']} {role} (ID: {proj_id[:8]})")
+        if str(user_id) in project['members']:
+            role = "👑" if project['owner_id'] == user_id else "👥"
+            user_projects.append(f"{role} {project['name']} (версий: {len(project['versions'])})")
 
     if not user_projects:
-        await update.message.reply_text("Вы не состоите ни в одном проекте.")
+        message = "Вы не состоите ни в одном проекте."
     else:
-        await update.message.reply_text("Ваши проекты и проекты с вашим участием:\n" + "\n".join(user_projects))
+        message = "📂 Ваши проекты:\n\n" + "\n".join(user_projects)
 
+        # Добавляем кнопки для каждого проекта
+        keyboard = []
+        for proj_id, project in context.bot_data['projects'].items():
+            if str(user_id) in project['members']:
+                keyboard.append([
+                    InlineKeyboardButton(
+                        f"{project['name']} ({len(project['versions'])})",
+                        callback_data=f"project_details:{proj_id}"
+                    )
+                ])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        if update.callback_query:
+            await update.callback_query.edit_message_text(message, reply_markup=reply_markup)
+        else:
+            await update.message.reply_text(message, reply_markup=reply_markup)
+        return
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(message)
+    else:
+        await update.message.reply_text(message)
 
 async def list_versions(update: Update, context: CallbackContext) -> None:
+    """Список версий проекта"""
     user_id = update.effective_user.id
+
+    # Если это callback от кнопки
+    if update.callback_query:
+        await update.callback_query.answer()
+        # Ожидаем формат callback_data="project_details:{proj_id}"
+        try:
+            proj_id = update.callback_query.data.split(':')[1]
+            project = context.bot_data['projects'].get(proj_id)
+
+            if not project or str(user_id) not in project['members']:
+                await update.callback_query.edit_message_text("Проект не найден или у вас нет доступа.")
+                return
+
+            response = f"📚 Версии проекта '{project['name']}':\n\n"
+            for ver in reversed(project['versions'][-10:]):  # Показываем последние 10 версий
+                response += (
+                    f"🔹 Версия {ver['version_num']} ({ver['file_name']})\n"
+                    f"   📅 {ver['timestamp']}\n"
+                    f"   👤 {ver['uploader_name']}\n"
+                    f"   📝 {ver['caption']}\n\n"
+                )
+
+            # Кнопки для управления проектом
+            keyboard = [
+                [
+                    InlineKeyboardButton("⬅️ Назад", callback_data='list_projects'),
+                    InlineKeyboardButton("📥 Получить версию", callback_data=f'get_version:{proj_id}')
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await update.callback_query.edit_message_text(response, reply_markup=reply_markup)
+        except Exception as e:
+            logger.error(f"Error in list_versions callback: {e}")
+            await update.callback_query.edit_message_text("Произошла ошибка при обработке запроса.")
+        return
+
+    # Если это обычная команда
     if not context.args:
         await update.message.reply_text("Укажите название проекта: /versions <название_проекта>")
         return
@@ -248,9 +491,55 @@ async def list_versions(update: Update, context: CallbackContext) -> None:
     else:
         await update.message.reply_text(response)
 
-
 async def get_version(update: Update, context: CallbackContext) -> None:
+    """Получение конкретной версии документа"""
     user_id = update.effective_user.id
+
+    # Если это callback от кнопки
+    if update.callback_query:
+        await update.callback_query.answer()
+        # Ожидаем формат callback_data="get_version:{proj_id}"
+        try:
+            proj_id = update.callback_query.data.split(':')[1]
+            project = context.bot_data['projects'].get(proj_id)
+
+            if not project or str(user_id) not in project['members']:
+                await update.callback_query.edit_message_text("Проект не найден или у вас нет доступа.")
+                return
+
+            if not project['versions']:
+                await update.callback_query.edit_message_text("В проекте нет версий.")
+                return
+
+            # Получаем последнюю версию
+            target_version = project['versions'][-1]
+
+            try:
+                await context.bot.send_document(
+                    chat_id=update.effective_chat.id,
+                    document=target_version['file_id'],
+                    caption=(
+                        f"📂 Проект: {project['name']}\n"
+                        f"🔹 Версия: {target_version['version_num']}\n"
+                        f"📝 Описание: {target_version['caption']}\n"
+                        f"👤 Автор: {target_version['uploader_name']}\n"
+                        f"📅 Дата: {target_version['timestamp']}"
+                    )
+                )
+                logger.info(
+                    f"Sent version {target_version['version_num']} of project {project['name']} to user {user_id}")
+            except Exception as e:
+                logger.error(
+                    f"Error sending document for project {proj_id}, version {target_version['version_num']}: {e}")
+                await update.callback_query.edit_message_text(
+                    "Не удалось отправить документ. Возможно, он был удален из истории чата с ботом."
+                )
+        except Exception as e:
+            logger.error(f"Error in get_version callback: {e}")
+            await update.callback_query.edit_message_text("Произошла ошибка при обработке запроса.")
+        return
+
+    # Если это обычная команда
     if not context.args:
         await update.message.reply_text("Укажите название проекта: /get <название_проекта> [номер_версии]")
         return
@@ -293,7 +582,13 @@ async def get_version(update: Update, context: CallbackContext) -> None:
         await context.bot.send_document(
             chat_id=update.effective_chat.id,
             document=target_version['file_id'],
-            caption=f"Проект: {project['name']}\nВерсия: {target_version['version_num']}\nФайл: {target_version['file_name']}\nОписание: {target_version['caption']}\nОт: {target_version['timestamp']}"
+            caption=(
+                f"Проект: {project['name']}\n"
+                f"Версия: {target_version['version_num']}\n"
+                f"Файл: {target_version['file_name']}\n"
+                f"Описание: {target_version['caption']}\n"
+                f"От: {target_version['timestamp']}"
+            )
         )
         logger.info(f"Sent version {target_version['version_num']} of project {project['name']} to user {user_id}")
     except Exception as e:
@@ -301,8 +596,8 @@ async def get_version(update: Update, context: CallbackContext) -> None:
         await update.message.reply_text(
             "Не удалось отправить документ. Возможно, он был удален из истории чата с ботом, или у бота проблемы с доступом к файлу.")
 
-
 async def add_member(update: Update, context: CallbackContext) -> None:
+    """Добавление участника в проект"""
     owner_id = update.effective_user.id
     if len(context.args) < 2:
         await update.message.reply_text("Использование: /addmember <название_проекта> <user_id или @username>")
@@ -319,43 +614,54 @@ async def add_member(update: Update, context: CallbackContext) -> None:
     project = context.bot_data['projects'][project_id]
 
     member_id_to_add = None
+
+    # Пытаемся разрешить username
     if member_identifier.startswith('@'):
-        await update.message.reply_text(
-            f"Для добавления по @username ({member_identifier}) этот пользователь должен был ранее написать боту. "
-            "Надежнее указать его числовой User ID."
-        )
-        return
+        member_id_to_add = await resolve_user_id(context, member_identifier)
+        if not member_id_to_add:
+            await update.message.reply_text(
+                "Не удалось найти пользователя по username. Убедитесь, что:\n"
+                "1. Пользователь начал диалог с ботом\n"
+                "2. Username указан правильно\n"
+                "3. Или используйте числовой ID пользователя"
+            )
+            return
     else:
         try:
             member_id_to_add = int(member_identifier)
         except ValueError:
-            await update.message.reply_text("Неверный формат User ID. Укажите числовой ID.")
+            await update.message.reply_text("Неверный формат User ID. Укажите числовой ID или @username.")
             return
 
     if member_id_to_add == owner_id:
         await update.message.reply_text("Вы уже являетесь владельцем и участником этого проекта.")
         return
 
-    if member_id_to_add in project['members']:
+    if str(member_id_to_add) in project['members']:
         await update.message.reply_text(
             f"Пользователь {member_id_to_add} уже является участником проекта '{project['name']}'.")
         return
 
-    project['members'].add(member_id_to_add)
-    await update.message.reply_text(f"Пользователь {member_id_to_add} добавлен в проект '{project['name']}'.")
+    project['members'].add(str(member_id_to_add))
+    save_data(context.bot_data)  # Сохраняем изменения
+
+    await update.message.reply_text(f"✅ Пользователь {member_id_to_add} добавлен в проект '{project['name']}'.")
     logger.info(f"User {owner_id} added member {member_id_to_add} to project '{project['name']}'")
 
     try:
         await context.bot.send_message(
             chat_id=member_id_to_add,
-            text=f"Вас добавили в проект '{project['name']}' (владелец: {update.effective_user.full_name})."
-                 f"\nИспользуйте /listprojects, чтобы увидеть его."
+            text=(
+                f"👋 Вас добавили в проект '{project['name']}'\n"
+                f"Владелец: {update.effective_user.full_name}\n\n"
+                f"Используйте /listprojects, чтобы увидеть свои проекты."
+            )
         )
     except Exception as e:
         logger.warning(f"Could not notify new member {member_id_to_add} for project {project_id}: {e}")
 
-
 async def remove_member(update: Update, context: CallbackContext) -> None:
+    """Удаление участника из проекта"""
     owner_id = update.effective_user.id
     if len(context.args) < 2:
         await update.message.reply_text("Использование: /removemember <название_проекта> <user_id или @username>")
@@ -373,9 +679,11 @@ async def remove_member(update: Update, context: CallbackContext) -> None:
 
     member_id_to_remove = None
     if member_identifier.startswith('@'):
-        await update.message.reply_text(
-            "Для удаления по @username, пожалуйста, используйте числовой User ID участника.")
-        return
+        member_id_to_remove = await resolve_user_id(context, member_identifier)
+        if not member_id_to_remove:
+            await update.message.reply_text(
+                "Не удалось найти пользователя по username. Укажите числовой User ID участника.")
+            return
     else:
         try:
             member_id_to_remove = int(member_identifier)
@@ -385,16 +693,18 @@ async def remove_member(update: Update, context: CallbackContext) -> None:
 
     if member_id_to_remove == owner_id:
         await update.message.reply_text(
-            "Владелец не может удалить сам себя из проекта. Если хотите передать права или удалить проект, это потребует других команд (пока не реализовано).")
+            "Владелец не может удалить сам себя из проекта.")
         return
 
-    if member_id_to_remove not in project['members']:
+    if str(member_id_to_remove) not in project['members']:
         await update.message.reply_text(
             f"Пользователь {member_id_to_remove} не является участником проекта '{project['name']}'.")
         return
 
-    project['members'].remove(member_id_to_remove)
-    await update.message.reply_text(f"Пользователь {member_id_to_remove} удален из проекта '{project['name']}'.")
+    project['members'].remove(str(member_id_to_remove))
+    save_data(context.bot_data)  # Сохраняем изменения
+
+    await update.message.reply_text(f"✅ Пользователь {member_id_to_remove} удален из проекта '{project['name']}'.")
     logger.info(f"User {owner_id} removed member {member_id_to_remove} from project '{project['name']}'")
 
     try:
@@ -405,8 +715,8 @@ async def remove_member(update: Update, context: CallbackContext) -> None:
     except Exception as e:
         logger.warning(f"Could not notify removed member {member_id_to_remove} for project {project_id}: {e}")
 
-
 async def list_members(update: Update, context: CallbackContext) -> None:
+    """Список участников проекта"""
     user_id = update.effective_user.id
     if not context.args:
         await update.message.reply_text("Укажите название проекта: /members <название_проекта>")
@@ -420,34 +730,82 @@ async def list_members(update: Update, context: CallbackContext) -> None:
         return
 
     project = context.bot_data['projects'][project_id]
-    members_list_str = f"Участники проекта '{project['name']}':\n"
+    members_list_str = f"👥 Участники проекта '{project['name']}':\n\n"
 
     member_details = []
     for member_id_in_set in project['members']:
-        prefix = "(Владелец) " if member_id_in_set == project['owner_id'] else ""
+        prefix = "👑 Владелец: " if member_id_in_set == str(project['owner_id']) else "👤 Участник: "
         member_name = f"ID: {member_id_in_set}"
 
-        uploader_found = False
+        # Пытаемся найти имя пользователя среди загруженных версий
         for ver in project['versions']:
-            if ver['uploader_id'] == member_id_in_set:
+            if str(ver['uploader_id']) == member_id_in_set:
                 member_name = f"{ver['uploader_name']} (ID: {member_id_in_set})"
-                uploader_found = True
                 break
 
-        member_details.append(f"- {prefix}{member_name}")
+        member_details.append(f"{prefix}{member_name}")
 
     if not member_details:
-        members_list_str += "В проекте нет участников (это ошибка, свяжитесь с администратором)."
+        members_list_str += "В проекте нет участников."
     else:
         members_list_str += "\n".join(sorted(member_details))
 
     await update.message.reply_text(members_list_str)
 
+async def handle_text(update: Update, context: CallbackContext) -> None:
+    """Обработка текстовых сообщений (для ожидания названия проекта)"""
+    user_id = update.effective_user.id
+
+    if 'awaiting_project_name' in context.user_data and context.user_data['awaiting_project_name']:
+        action = context.user_data.get('action')
+
+        if action == 'new_project':
+            await _create_project(update, context, update.message.text)
+        elif action == 'commit_project':
+            await _add_version_to_project(update, context, update.message.text, "")
+
+        # Очищаем флаги
+        context.user_data.pop('awaiting_project_name', None)
+        context.user_data.pop('action', None)
+        return
+
+    # Если это не ожидаемое сообщение, просто игнорируем
+    return
+
+async def button_handler(update: Update, context: CallbackContext) -> None:
+    """Обработчик нажатий на кнопки"""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+
+    if data == 'show_help':
+        await help_command(update, context)
+    elif data == 'list_projects':
+        await list_projects(update, context)
+    elif data == 'new_project':
+        await new_project(update, context)
+    elif data == 'commit_project':
+        await commit_version(update, context)
+    elif data.startswith('project_details:'):
+        await list_versions(update, context)
+    elif data.startswith('get_version:'):
+        await get_version(update, context)
+    elif data.startswith('commit_to:'):
+        project_name = data.split(':')[1]
+        await _add_version_to_project(update, context, project_name, "Обновление через кнопку")
 
 def main() -> None:
     """Запуск бота."""
+    # Загружаем сохраненные данные
+    bot_data = load_data()
+
     application = Application.builder().token(BOT_TOKEN).build()
 
+    # Устанавливаем загруженные данные
+    application.bot_data.update(bot_data)
+
+    # Обработчики команд
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("newproject", new_project))
@@ -459,11 +817,15 @@ def main() -> None:
     application.add_handler(CommandHandler("removemember", remove_member))
     application.add_handler(CommandHandler("members", list_members))
 
+    # Обработчики сообщений
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    # Обработчик кнопок
+    application.add_handler(CallbackQueryHandler(button_handler))
 
     logger.info("Bot started...")
     application.run_polling()
-
 
 if __name__ == '__main__':
     main()
